@@ -1,5 +1,11 @@
 import Queue as tQueue
+from Queue import Empty, Full
 import itertools
+from time import time as _time
+
+_threading = tQueue._threading
+Thread = _threading.Thread
+Condition = _threading.Condition
 
 class Closed(Exception):
     "Exception raised by closed queue"
@@ -29,24 +35,22 @@ def _QueueMaker(base, name=None):
           circumstances. An iteration blocked in the `next` call will also receive
           `StopIteration` and therefore end the iterating loop
         """
-        def __init__(self, *args, **kwargs):
+        def __init__(self, iterable=None, *args, **kwargs):
             """
             Can be initialized with an iterable with the kwarg `iterable=` this
               causes `produce` to be called with the iterable and `close` set
               to True
 
             """
-            kwargs2 = dict(kwargs)
-            if "iterable" in kwargs:
-                del kwargs["iterable"]
             base.__init__(self, *args, **kwargs)
             assert not hasattr(self, '_closed')
             self._closed = False
             self._iters = None
             self._iter_close = False
+            self.iter_cond = Condition(self.mutex)
 
-            if "iterable" in kwargs2:
-                self.produce(kwargs2["iterable"], close=True)
+            if iterable:
+                self.produce(iterable, close=True)
 
         def produce(self, iterable, close=False):
             """
@@ -82,15 +86,42 @@ def _QueueMaker(base, name=None):
             Raises `Closed` exception if the queue is already closed.
             """
 
-            self.mutex.acquire()
+            self.iter_cond.acquire()
             try:
                 if not self._iters:
-                    self._iters = iterable
+                    self._iters = iter(iterable)
                 else:
-                    self._iters = itertools.chain(self._iters, iterable)
+                    self._iters = itertools.chain(self._iters, iter(iterable))
                 self._iter_close = close
+                self.iter_cond.notify()
             finally:
-                self.mutex.release()
+                self.iter_cond.release()
+
+            def add_thread():
+                while True:
+                    self.iter_cond.acquire()
+                    try:
+                        while not self._iters:
+                            if self._closed:
+                                return
+                            self.iter_cond.wait()
+                        item = next(self._iters)
+                    except StopIteration:
+                        if self._iter_close:
+                            self._closed = True
+                            return
+                        else:
+                            # wait for another iterator to be added
+                            continue
+                    finally:
+                        self.iter_cond.release()
+                    # now add the item to the q
+                    self.put(item)
+
+            if not hasattr(self, "_add_thread"):
+                self._add_thread = Thread(target=add_thread, name="add_thread")
+                self._add_thread.setDaemon(True)
+                self._add_thread.start()
 
         def close(self):
             """Close the queue.
@@ -110,6 +141,7 @@ def _QueueMaker(base, name=None):
                     self._closed = True
                     self.not_empty.notify_all()
                     self.not_full.notify_all()
+                    self.iter_cond.notify_all()
             finally:
                 self.mutex.release()
 
@@ -153,20 +185,6 @@ def _QueueMaker(base, name=None):
                 self.not_full.release()
 
         def get(self, block=True, timeout=None):
-            self.not_full.acquire()
-            try:
-                # add up to 2 items to queue from iterable
-                if self._iters:
-                    for i in range(2):
-                        if self._qsize() < self.maxsize:
-                            self._put(next(self._iters))
-            except StopIteration:
-                self._iters = None
-                if self._iter_close:
-                    self._closed = True
-            finally:
-                self.not_full.release()
-
             self.not_empty.acquire()
             try:
                 if not block:
@@ -197,15 +215,39 @@ def _QueueMaker(base, name=None):
             finally:
                 self.not_empty.release()
 
+        def join(self, block=True, timeout=None):
+            self.all_tasks_done.acquire()
+            try:
+                if not block:
+                    if self.unfinished_tasks:
+                        raise Full
+                elif timeout is None:
+                    while self.unfinished_tasks:
+                        self.all_tasks_done.wait()
+                elif timeout < 0:
+                    raise ValueError("'timeout' must be a positive number")
+                else:
+                    endtime = _time() + timeout
+                    while self.unfinished_tasks:
+                        remaining = endtime - _time()
+                        if remaining <= 0.0:
+                            raise Full
+                        self.all_tasks_done.wait(remaining)
+            finally:
+                self.all_tasks_done.release()
+
         # Be an iterator!!! YEAH!
         def __iter__(self):
             return self
 
         def __next__(self):
-            self.get()
+            try:
+                return self.get()
+            except Empty:
+                raise StopIteration
 
         def next(self):
-            return self.get()
+            return self.__next__()
 
     _IterQueue.__name__ = name
     return _IterQueue
