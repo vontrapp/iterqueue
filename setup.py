@@ -3,7 +3,7 @@
 from distutils.core import setup
 
 setup(name="python-iterqueue",
-      version="0.1",
+      version="0.2",
       author="Von Fugal",
       author_email="von@fugal.net",
       py_modules=["IterQueue"],
